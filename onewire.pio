@@ -45,18 +45,19 @@
 ; If you desire to do such things, you have to check that
 ; the state machine has reached the 'waiting' label by polling
 ; the PIO program counter.
-;   This is clumpsy, but can only be changed by increasing PIO code
+;   POSSIBLE TODO:
+;   This is clumsy, but can only be changed by increasing PIO code
 ;   size (Probably three instructions):
 ;     - first moving pins to x at the sample point
 ;     - then finish bit timing (maybe wrapped into the previous)
 ;     - then push x to the RX FIFO
-;     - needed for rx/tx- and reset-branch
-;   This will impact performance as the change would introduce a
+;     - needed for rx-, tx- and reset-branch
+;   This will also impact performance as the change would introduce a
 ;   6us gap between all bits.
 ;   However that change might be desireable if you wish an interrupt
 ;   driven ARM code w.o. any ARM time wasted by polling.
 ;
-; 1-Wire Timing:
+; 1-Wire Timing (all numbers are us):
 ;        ____     ______________  _____________
 ; 1-Bit      \___/       S-P                   \___ 
 ;            |<6>|<   9  >|           |
@@ -72,7 +73,7 @@
 ; with delay counting only (no looping).
 ; Above timings were taken from Maxim AN 126.
 ;
-; 1-Wire Presence Detect (5ns/column):
+; 1-Wire Presence Detect (5us/column):
 ;                 ___             _______  _______
 ; Fast Device    /   ____________/
 ;                 ____________                 ___
@@ -81,7 +82,7 @@
 ;                <            75 >
 ;                <                        300 >
 ;
-; The overlap low time of slow and fast silicon is only 15 ns!
+; The overlap low time of slow and fast silicon is only 15 us!
 
 
 ; The reset-branch asumes 70us instruction timing (CLKDIV = CPU-MHz*70)
