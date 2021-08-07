@@ -1,4 +1,13 @@
+/*
+ * Copyright (c) 2021 Stefan Althöfer
+ *
+ * OWxxxx functions might fall under Maxxim copyriht.
+ *
+ * Demo code for PIO 1-Wire interface
+ */
+
 #include <stdio.h>
+#include <string.h>
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
 #include "hardware/pio.h"
@@ -32,7 +41,6 @@ struct owobj {
     int LastDeviceFlag;
     unsigned char crc8;
 };
-
 
 /* Sample state machine instruction pointer for some time and
    print for diagnostic purposes */
@@ -329,6 +337,24 @@ static unsigned char calc_crc8_buf(unsigned char *data, int len)
     return crc8;
 }
 
+/* Select a device by ROM ID */
+int onewire_select(
+    struct owobj  *owobj, 
+    unsigned char *romid
+)
+{
+    int    i;
+    
+    if( ! onewire_reset(owobj) ){
+        return 0;
+    }
+    onewire_tx_byte(owobj, 0x55); // Match ROM command
+    for(i=0; i<8; i++){
+        onewire_tx_byte(owobj, romid[i]);
+    }
+    return 1;
+}
+
 /* This is code stolen from MAXIM AN3684, slightly modified
    to interface to the PIO onewire and to eliminate global
    variables. */
@@ -491,6 +517,14 @@ int OWSearch(struct owobj *owobj)
     }
 
     return search_result;
+}
+
+int OWSearchReset(struct owobj *owobj)
+{
+    // reset the search state
+    owobj->LastDiscrepancy = 0;
+    owobj->LastDeviceFlag = FALSE;
+    owobj->LastFamilyDiscrepancy = 0;
 }
 
 //--------------------------------------------------------------------------
@@ -756,6 +790,302 @@ void onewire_test_romsearch(struct owobj *owobj){
 #endif
 }
 
+/* onewire_temp_app: Large scale example.
+ *
+ * Assumes: Only DS18B20 (or compatible) sensors on the 1-Wire and
+ * they are using phantom power (external strong pullup via MOSFET).
+ *
+ * Scan all 1-Wire buses for all devices and convert all temperatures
+ * periodically. While scanning temperatures, do a "background" scan
+ * to check for removed are added sensors.
+ *
+ * The code assumes that the T_H register is programmed with a "unique"
+ * 8-bit identification number for each sensor, so sensors can be
+ * distinguished easily (without knowing their actual ROM-ID).
+ * Remember that T_H is backed-up in EEPROM.
+ * 
+ * Output format:
+ * || LOOP || N ||  T-ID ||  T-ID ||
+ * |  1234 |  2 | -99.87 | 103.54 |
+ *
+ * N is the numer of sensors found and is added for convenience to easyly
+ * check sensor setup.
+ */
+
+/* number for 1wire channels for this test */
+#define N_CH       2 
+/* max number of devices for one 1 wire channel */
+#define MAX_TDEV  64  
+
+#define MAX_LINE_LENGTH ((MAX_TDEV)*9+2)
+char hd_buf[MAX_LINE_LENGTH];
+char dt_buf[MAX_LINE_LENGTH];
+int  hd_pos;
+int  dt_pos;
+
+struct tdev {
+    unsigned char rom_id[8];
+    unsigned char dev_id;
+    int32_t       temp;
+    int           fail;     /* 0: ok, 1: invalid temperature */
+};
+
+struct ch_obj {
+    struct tdev tdevs[MAX_TDEV]; /* active devices */
+    struct tdev sdevs[MAX_TDEV]; /* searching devices */
+    int         spos;            /* search position, -1 if search is done */
+};
+
+struct ch_obj ch_objs[N_CH];
+
+void onewire_temp_app(
+    struct owobj *owobj1,
+    struct owobj *owobj2
+){
+    int i;
+    int n;
+    int c;
+    int t;
+    int s_cnt;
+    int s_id;
+    int ret;
+    unsigned char buf[9];
+    int32_t temp;
+    int fail;
+    int num_sensors;
+    int searching;
+    int loop;
+
+    struct owobj * owobjs[N_CH];
+    owobjs[0] = owobj1;
+    owobjs[1] = owobj2;
+
+    /* Init all 1-Wire channels */
+    for(c=0; c<N_CH; c++){
+        onewire_program_init(owobjs[c]->pio, owobjs[c]->sm,
+                             owobjs[c]->offset, owobjs[c]->pin,
+                             owobjs[c]->pinctlz);
+        pio_sm_set_enabled(owobjs[c]->pio, owobjs[c]->sm, true);
+        for(t=0; t<MAX_TDEV; t++){
+            memset(&ch_objs[c].tdevs[t].rom_id[0], 0, 8);
+        }
+    }
+
+    /* Initially scan for devices */
+    for(c=0; c<N_CH; c++){
+        ret = OWFirst(owobjs[c]);
+        t = 0;
+        while( ret == TRUE ){
+            memcpy(ch_objs[c].tdevs[t].rom_id,
+                   owobjs[c]->ROM_NO, 8);
+
+            /* Read sensor ID (stored in T_H byte of all sensors) */
+            onewire_tx_byte(owobjs[c], 0xbe); // Read Scatchpad
+            for(i=0; i<9; i++){
+                buf[i] = onewire_rx_byte(owobjs[c]);
+            }
+            /* FIXME: Should check CRC */
+            ch_objs[c].tdevs[t].dev_id = buf[2];
+
+            t++;
+            ret = OWNext(owobjs[c]);
+        }
+    }
+
+    /* Prepare for background searching of devices */
+    for(c=0; c<N_CH; c++){
+        OWSearchReset(owobjs[c]);
+        ch_objs[c].spos = 0;
+        for(t=0; t<MAX_TDEV; t++){
+            memset(&ch_objs[c].sdevs[t].rom_id[0], 0, 8);
+        }
+    }
+
+#if 0
+    /* Print list of sensors */
+    for(c=0; c<N_CH; c++){
+        for(t=0; t<MAX_TDEV; t++){
+            if( ch_objs[c].tdevs[t].rom_id[0] == 0x28 ){
+                printf("%d,%d:", c, t);
+                for(i=0; i<8; i++){
+                    printf(" %.2x", ch_objs[c].tdevs[t].rom_id[i]);
+                }
+                printf(" (%2d)", ch_objs[c].tdevs[t].dev_id);
+                printf("\n");
+            } else {
+                continue;
+            }
+        }
+    }
+#endif
+
+    /* Scan temperatures forever */
+    loop = 0;
+    while( 1 ){
+        loop++;
+
+        /* Convert temperatures */
+        for(c=0; c<N_CH; c++){
+            if( ! onewire_reset(owobjs[c]) ){
+                break;
+            }
+            onewire_tx_byte(owobjs[c], 0xcc); // Skip ROM command
+            onewire_tx_byte_spu(owobjs[c], 0x44); // Convert T
+        }
+        sleep_ms(760);  /* 12bit: max. 750 ms */
+        for(c=0; c<N_CH; c++){
+            onewire_end_spu(owobjs[c]);
+        }
+
+        /* Read values */
+        num_sensors = 0;
+        for(c=0; c<N_CH; c++){
+            for(t=0; t<MAX_TDEV; t++){
+                if( ch_objs[c].tdevs[t].rom_id[0] != 0x28 ){
+                    continue;
+                }
+
+                num_sensors++;
+                ch_objs[c].tdevs[t].fail = 0;
+                if( onewire_select(owobjs[c],
+                                   ch_objs[c].tdevs[t].rom_id) == 0 )
+                {
+                    ch_objs[c].tdevs[t].fail++;
+                }
+
+                if(ch_objs[c].tdevs[t].fail == 0 ){
+                    onewire_tx_byte(owobjs[c], 0xbe); // Read Scatchpad
+                    for(i=0; i<9; i++){
+                        buf[i] = onewire_rx_byte(owobjs[c]);
+                    }
+                    if( calc_crc8_buf(buf, 8) != buf[8] ){
+                        /* CRC error */
+                        ch_objs[c].tdevs[t].fail++;
+                    } else {
+                        temp = buf[0]|(buf[1]<<8);
+                        if( temp & 0x8000 ){
+                            temp |= 0xffff0000;
+                        }
+                        ch_objs[c].tdevs[t].temp = temp;
+                    }
+                }
+            }
+        }
+
+        /* Print them all with a very brute force sorting */
+        hd_buf[0] = '\0';
+        dt_buf[0] = '\0';
+        hd_pos = 0;
+        dt_pos = 0;
+        s_id = 0;
+        s_cnt = 0;
+        /* Search until we either have found all sensors
+           or have passed the maximum possible sensor id */
+        while( s_cnt<num_sensors && s_id < 256 ){
+            for(c=0; c<N_CH; c++){
+                for(t=0; t<MAX_TDEV; t++){
+                    if( ch_objs[c].tdevs[t].rom_id[0] != 0x28 ){
+                        continue;
+                    }
+                    if( ch_objs[c].tdevs[t].dev_id == s_id ){
+                        /* 9 chars per sensors            123456789 */
+                        hd_pos += sprintf(hd_buf+hd_pos, "||   %3d ", 
+                                          ch_objs[c].tdevs[t].dev_id);
+                        if( ch_objs[c].tdevs[t].fail ){
+                            dt_pos += sprintf(dt_buf+dt_pos, "|    NaN ");
+                        } else {
+                            temp = ch_objs[c].tdevs[t].temp;
+                            dt_pos += sprintf(dt_buf+dt_pos, "| %6.2f ", 
+                                              (float)temp/16);
+                        }
+                        s_cnt++; /* one found */
+                        goto next_search;
+                    }
+                }
+            }
+        next_search:
+            s_id++;
+        }
+
+        /* Print what we have */
+        printf("|| LOOP || N %s ||\n", hd_buf);
+        printf("| %5d |%3d %s |\n", loop & 0xffff, num_sensors, dt_buf);
+
+        /* Now scan 1-Wire to check for change in devices.
+           Note: One ROM search takes about 15 ms.
+           To avoid sacrifying scan time for large sensor counts, we
+           only scan for three devices in one scan loop. */
+        searching = 0; /* set if any device is still in search */
+        for(c=0; c<N_CH; c++){
+            for(n=0; n<3; n++){
+                if( ch_objs[c].spos >= 0 ){
+                    searching++;
+                    ret = OWNext(owobjs[c]);
+                    if( ret == FALSE ){
+                        ch_objs[c].spos = -1;
+                    } else {
+                        memcpy(ch_objs[c].sdevs[ch_objs[c].spos].rom_id,
+                               owobjs[c]->ROM_NO, 8);
+
+                        /* Read sensor ID (stored in T_H byte of all sensors) */
+                        onewire_tx_byte(owobjs[c], 0xbe); // Read Scatchpad
+                        for(i=0; i<9; i++){
+                            buf[i] = onewire_rx_byte(owobjs[c]);
+                        }
+                        /* FIXME: Should check CRC */
+                        ch_objs[c].sdevs[ch_objs[c].spos].dev_id = buf[2];
+
+                        ch_objs[c].spos++;
+                    }
+                }
+            }
+        }
+
+        if( searching == 0 ){
+#if 0
+            /* Print list of found sensors */
+            for(c=0; c<N_CH; c++){
+                for(t=0; t<MAX_TDEV; t++){
+                    if( ch_objs[c].sdevs[t].rom_id[0] == 0x28 ){
+                        printf("%d,%d:", c, t);
+                        for(i=0; i<8; i++){
+                            printf(" %.2x", ch_objs[c].sdevs[t].rom_id[i]);
+                        }
+                        printf(" (%2d)", ch_objs[c].sdevs[t].dev_id);
+                        printf("\n");
+                    } else {
+                        continue;
+                    }
+                }
+            }
+#endif
+
+            /* Copy over from sdevs to tdevs. This is possible as
+               tdevs does not store data which must persist over
+               on scan loop. */
+            for(c=0; c<N_CH; c++){
+                memcpy(ch_objs[c].tdevs,
+                       ch_objs[c].sdevs,
+                       sizeof(ch_objs[c].tdevs));
+            }
+            
+            /* Reset for next background search */
+            for(c=0; c<N_CH; c++){
+                OWSearchReset(owobjs[c]);
+                ch_objs[c].spos = 0;
+                for(t=0; t<MAX_TDEV; t++){
+                    memset(&ch_objs[c].sdevs[t].rom_id[0], 0, 8);
+                }
+            }
+        }
+
+        /* Activity indicator */
+        gpio_xor_mask(1<<LED_PIN);
+    }
+}
+
+
+
 
 int main() {
     bi_decl(bi_program_description("This is a test binary."));
@@ -765,6 +1095,7 @@ int main() {
     uint offset_blink;
     uint offset_1wire;
     struct owobj owobj1;
+    struct owobj owobj2;
 
     gpio_init(LED_PIN);
     gpio_set_dir(LED_PIN, GPIO_OUT);
@@ -780,28 +1111,32 @@ int main() {
        code conflicts with this. */
     offset_blink = pio_add_program(pio, &blink_program);
     blink_pin_forever(pio, 0, offset_blink, 0, 3);
-    blink_pin_forever(pio, 1, offset_blink, 6, 4);
-    blink_pin_forever(pio, 2, offset_blink, 11, 1);
+    blink_pin_forever(pio, 1, offset_blink, 11, 1);
 
     /* Onewire config */
     offset_1wire = pio_add_program(pio, &onewire_program);
     owobj1.pio = pio;
-    owobj1.sm = 3;
+    owobj1.sm = 2;
     owobj1.offset = offset_1wire;
     owobj1.pin = 15;
     owobj1.pinctlz = 14;
 
-    while (1) {
+    owobj2.pio = pio;
+    owobj2.sm = 3;
+    owobj2.offset = offset_1wire;
+    owobj2.pin = 13;
+    owobj2.pinctlz = 12;
     
+    while (1) {
         //onewire_test_ds18b20_scratchpad(&owobj1);
         //onewire_test_ds18b20_conversion(&owobj1);
         //onewire_test_wordlength(&owobj1);
         //onewire_test_spu(&owobj1);
-        onewire_test_romsearch(&owobj1);
-
-        gpio_put(LED_PIN, 0);
-        sleep_ms(50);
-        gpio_put(LED_PIN, 1);
-        sleep_ms(100);
+        //onewire_test_romsearch(&owobj1);
+        //onewire_test_romsearch(&owobj2);
+        onewire_temp_app(&owobj1,&owobj2);
+        
+        gpio_xor_mask(1<<LED_PIN);
+        sleep_ms(75);
     }
  }
